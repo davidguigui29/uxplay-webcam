@@ -12,43 +12,11 @@ from gi.repository import Gst, GLib
 # Initialize GStreamer
 Gst.init(sys.argv)
 
-INTERMEDIATE_CAM = "/dev/video10"
-VIRTUAL_CAM = "/dev/video11"
+INTERMEDIATE_CAM = "/dev/video11"
+VIRTUAL_CAM = "/dev/video12"
 MAX_RETRIES = 3
 
-# ============================================================
-# Startup device check: verify /dev/video11 is writable
-# ============================================================
-def check_device_available():
-    """Verify the virtual camera device is available for writing."""
-    try:
-        result = subprocess.run(
-            ["lsof", VIRTUAL_CAM],
-            capture_output=True, text=True, timeout=5
-        )
-        # Filter out lsof warnings, keep actual process lines
-        holders = []
-        for line in result.stdout.splitlines():
-            if line.startswith("COMMAND") or "WARNING" in line or "can't stat" in line or "Output info" in line:
-                continue
-            if line.strip():
-                parts = line.split()
-                if len(parts) >= 2:
-                    holders.append(f"{parts[0]} (PID {parts[1]})")
-        
-        if holders:
-            sys.stderr.write(f"\n[ERROR] {VIRTUAL_CAM} is locked by other processes:\n")
-            for h in holders:
-                sys.stderr.write(f"  - {h}\n")
-            sys.stderr.write(f"\nPlease close those applications and try again.\n\n")
-            return False
-    except Exception:
-        pass  # lsof not available or timed out, proceed anyway
-    
-    return True
-
-if not check_device_available():
-    sys.exit(1)
+# Startup device check removed because dynamically created devices with pre-set caps can safely be held by browsers
 
 # ============================================================
 # The Core Pipeline
@@ -61,9 +29,9 @@ if not check_device_available():
 pipeline_str = f"""
     input-selector name=selector ! 
     videoconvert ! videoflip name=flip method=none ! aspectratiocrop name=crop aspect-ratio=0/1 ! 
-    videoconvert ! video/x-raw,pixel-aspect-ratio=1/1 ! videoscale add-borders=true ! video/x-raw,width=1280,height=720,format=YUY2,framerate=60/1,pixel-aspect-ratio=1/1 ! v4l2sink device={VIRTUAL_CAM}
+    videoconvert ! videoscale add-borders=true ! video/x-raw,width=1280,height=720,format=YUY2,framerate=30/1 ! v4l2sink device={VIRTUAL_CAM}
 
-    videotestsrc is-live=true pattern=smpte ! video/x-raw,framerate=60/1,pixel-aspect-ratio=1/1 ! videoconvert ! selector.sink_0
+    videotestsrc is-live=true pattern=smpte ! video/x-raw,framerate=30/1 ! videoconvert ! selector.sink_0
 """
 
 try:
@@ -130,9 +98,9 @@ def connection_monitor():
         
         if connected and not is_live:
             try:
-                # Create live camera source dynamically, immediately matching the 60fps requirement!
+                # Create live camera source dynamically, immediately matching the 30fps requirement!
                 live_bin = Gst.parse_bin_from_description(
-                    f"v4l2src device={INTERMEDIATE_CAM} ! videoconvert ! videorate ! capsfilter caps=video/x-raw,framerate=60/1",
+                    f"v4l2src device={INTERMEDIATE_CAM} ! videoconvert ! videorate ! capsfilter caps=video/x-raw,framerate=30/1",
                     True
                 )
                 pipeline.add(live_bin)

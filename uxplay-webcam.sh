@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Target Virtual Video Devices
-INTERMEDIATE_CAM="/dev/video10"  # Raw stream from UxPlay
-VIRTUAL_CAM="/dev/video11"       # Final output for Web Browser / Apps
+INTERMEDIATE_CAM="/dev/video11"  # Raw stream from UxPlay
+VIRTUAL_CAM="/dev/video12"       # Final output for Web Browser / Apps
 
 # Default states
 MODE="f"      # 'f' = front camera (normal), 'b' = back camera (horizontal flip)
@@ -23,6 +23,9 @@ nuke_stale_processes() {
     pkill -9 -f "v4l2sink device=$VIRTUAL_CAM" 2>/dev/null
     pkill -9 -f "v4l2sink device=$INTERMEDIATE_CAM" 2>/dev/null
 
+    # Destroy the virtual device if it was left behind
+    v4l2loopback-ctl delete $VIRTUAL_CAM 2>/dev/null
+
     # Kill any orphaned uxplay (but NOT the systemd one yet — that's handled separately)
     killall -9 uxplay 2>/dev/null
 
@@ -33,19 +36,7 @@ nuke_stale_processes() {
 # ============================================================
 # Verify /dev/video11 is free before we try to use it
 # ============================================================
-check_device_free() {
-    local holders
-    holders=$(lsof "$VIRTUAL_CAM" 2>/dev/null | grep -v "^COMMAND" | grep -v "WARNING" | grep -v "Output info" | grep -v "can't stat" | awk '{print $1 "(" $2 ")"}' | sort -u | tr '\n' ' ')
-    
-    if [ -n "$holders" ]; then
-        echo ""
-        echo "[ERROR] $VIRTUAL_CAM is still held by: $holders"
-        echo "Please close those applications and try again."
-        echo ""
-        return 1
-    fi
-    return 0
-}
+# check_device_free is no longer needed since we dynamically create the device and set caps
 
 start_uxplay() {
     echo "Starting background UxPlay server (AirPlay Receiver)..."
@@ -96,6 +87,10 @@ cleanup() {
     echo -e "\nExiting..."
     stop_engine
     stop_uxplay
+    
+    echo "Destroying dynamic virtual camera..."
+    v4l2loopback-ctl delete $VIRTUAL_CAM 2>/dev/null
+
     echo "Restarting background UxPlay service for normal desktop mirroring..."
     systemctl --user start uxplay.service 2>/dev/null
     echo "Done!"
@@ -114,10 +109,14 @@ systemctl --user stop uxplay.service 2>/dev/null
 echo "Cleaning up stale processes..."
 nuke_stale_processes
 
-# Verify device is free
-if ! check_device_free; then
+echo "Creating dynamic virtual camera ($VIRTUAL_CAM)..."
+v4l2loopback-ctl add -n "UxPlay Screen" -x 1 $VIRTUAL_CAM || {
+    echo "[ERROR] Failed to create dynamic virtual camera device!"
     exit 1
-fi
+}
+v4l2loopback-ctl set-caps $VIRTUAL_CAM "YUYV:1280x720@30/1"
+
+
 
 echo "------------------------------------------------------------------------"
 echo "UxPlay Virtual Webcam initialized! (Powered by Python Engine)"
