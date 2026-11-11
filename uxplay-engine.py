@@ -12,6 +12,9 @@ from gi.repository import Gst, GLib
 # Initialize GStreamer
 Gst.init(sys.argv)
 
+# Device assignments:
+# INTERMEDIATE_CAM = Raw stream from UxPlay ("UxPlay Raw Feed")
+# VIRTUAL_CAM = Final 720p virtual webcam for web applications ("UxPlay Virtual Webcam")
 INTERMEDIATE_CAM = "/dev/video11"
 VIRTUAL_CAM = "/dev/video12"
 MAX_RETRIES = 3
@@ -29,9 +32,9 @@ MAX_RETRIES = 3
 pipeline_str = f"""
     input-selector name=selector ! 
     videoconvert ! videoflip name=flip method=none ! aspectratiocrop name=crop aspect-ratio=0/1 ! 
-    videoconvert ! videoscale add-borders=true ! video/x-raw,width=1280,height=720,format=YUY2,framerate=30/1 ! v4l2sink device={VIRTUAL_CAM}
+    videoconvert ! videoscale add-borders=true ! capsfilter caps=video/x-raw,width=1280,height=720,format=YUY2,framerate=30/1,pixel-aspect-ratio=1/1,colorimetry=bt709,interlace-mode=progressive,multiview-mode=mono ! v4l2sink device={VIRTUAL_CAM} sync=false
 
-    videotestsrc is-live=true pattern=smpte ! video/x-raw,framerate=30/1 ! videoconvert ! selector.sink_0
+    videotestsrc is-live=true pattern=smpte ! videoconvert ! videorate ! capsfilter caps=video/x-raw,format=YUY2,framerate=30/1,colorimetry=bt709 ! selector.sink_0
 """
 
 try:
@@ -49,7 +52,16 @@ bus = pipeline.get_bus()
 # Start playing the Standby pattern immediately
 ret = pipeline.set_state(Gst.State.PLAYING)
 if ret == Gst.StateChangeReturn.FAILURE:
-    sys.stderr.write("[ERROR] Failed to start pipeline.\n")
+    time.sleep(0.5)
+    ret = pipeline.set_state(Gst.State.PLAYING)
+
+if ret == Gst.StateChangeReturn.FAILURE:
+    msg = bus.pop_filtered(Gst.MessageType.ERROR)
+    if msg:
+        err, debug = msg.parse_error()
+        sys.stderr.write(f"[ERROR] Failed to start pipeline: {err.message} ({debug})\n")
+    else:
+        sys.stderr.write("[ERROR] Failed to start pipeline.\n")
     sys.exit(1)
 
 def check_loopback():
@@ -60,91 +72,127 @@ def check_loopback():
     except:
         return False
 
-def command_listener():
-    """ Listens for user commands from the Bash wrapper and dynamically changes properties without restarting! """
-    for line in sys.stdin:
-        cmd = line.strip().lower()
-        
-        # Don't try to change properties if the pipeline is restarting or down
+def apply_command(cmd):
+    """ Executes user commands thread-safely on the GLib main loop """
+    try:
         _, state, _ = pipeline.get_state(0)
         if state != Gst.State.PLAYING:
-            continue
+            return False
             
-        try:
-            if cmd == 'f':
-                flip.set_property("method", 0)
-            elif cmd == 'b':
-                flip.set_property("method", 4)
-            elif cmd == 'p':
-                Gst.util_set_object_arg(crop, "aspect-ratio", "0/1")  # native (bypass crop)
-            elif cmd == 'l':
-                Gst.util_set_object_arg(crop, "aspect-ratio", "16/9")
-            elif cmd == 's':
-                Gst.util_set_object_arg(crop, "aspect-ratio", "1/1")
-            elif cmd == 'q':
-                pipeline.set_state(Gst.State.NULL)
-                os._exit(0)
-        except Exception as e:
-            sys.stderr.write(f"\\n[WARN] Ignored command during restart: {e}\\n")
+        if cmd == 'f':
+            flip.set_property("method", 0)
+        elif cmd == 'b':
+            flip.set_property("method", 4)
+        elif cmd == 'p':
+            Gst.util_set_object_arg(crop, "aspect-ratio", "0/1")  # native (bypass crop)
+        elif cmd == 'l':
+            Gst.util_set_object_arg(crop, "aspect-ratio", "16/9")
+        elif cmd == 's':
+            Gst.util_set_object_arg(crop, "aspect-ratio", "1/1")
+        elif cmd == 'q':
+            pipeline.set_state(Gst.State.NULL)
+            os._exit(0)
+    except Exception as e:
+        sys.stderr.write(f"\n[WARN] Ignored command: {e}\n")
+    return False
 
-def connection_monitor():
-    """ Monitors the iPhone connection and seamlessly injects the live feed into the running pipeline! """
+def command_listener():
+    """ Listens for user commands from the Bash wrapper and delegates to GLib main thread """
+    for line in sys.stdin:
+        cmd = line.strip().lower()
+        GLib.idle_add(apply_command, cmd)
+
+live_bin = None
+live_pad = None
+is_live = False          # live source bin is attached to the selector
+live_active = False      # selector is currently showing the live source
+last_buf_time = 0.0      # updated from the streaming thread whenever a live frame arrives
+
+def _on_live_buffer(pad, info):
+    global last_buf_time
+    last_buf_time = time.time()
+    return Gst.PadProbeReturn.OK
+
+def do_connect():
+    """ Attaches the live iPhone source (on the GLib main loop). It is NOT shown until real frames arrive. """
+    global live_bin, live_pad, is_live, last_buf_time
+    if is_live:
+        return False
+    try:
+        last_buf_time = 0.0
+        live_bin = Gst.parse_bin_from_description(
+            f"v4l2src device={INTERMEDIATE_CAM} ! videoconvert ! videorate ! capsfilter caps=video/x-raw,format=YUY2,framerate=30/1,colorimetry=bt709",
+            True
+        )
+        pipeline.add(live_bin)
+        live_pad = selector.request_pad_simple("sink_%u")
+        src_pad = live_bin.get_static_pad("src")
+        src_pad.add_probe(Gst.PadProbeType.BUFFER, _on_live_buffer)
+        src_pad.link(live_pad)
+        live_bin.sync_state_with_parent()
+        is_live = True
+    except Exception as e:
+        sys.stderr.write(f"[WARN] Failed to connect live source: {e}\n")
+        _teardown_live()
+    return False
+
+def _teardown_live():
+    global live_bin, live_pad, is_live, live_active
+    try:
+        selector.set_property("active-pad", selector.get_static_pad("sink_0"))
+    except Exception:
+        pass
+    live_active = False
+    if live_bin:
+        try:
+            live_bin.set_state(Gst.State.NULL)
+            src_pad = live_bin.get_static_pad("src")
+            if src_pad and live_pad:
+                src_pad.unlink(live_pad)
+            if live_pad:
+                selector.release_request_pad(live_pad)
+            pipeline.remove(live_bin)
+        except Exception as e:
+            sys.stderr.write(f"[WARN] Failed to remove live source: {e}\n")
     live_bin = None
     live_pad = None
     is_live = False
-    
+
+def do_disconnect():
+    """ iPhone gone: drop the live source and go back to the standby pattern. """
+    if is_live:
+        _teardown_live()
+    return False
+
+def set_live_active(active):
+    """ Switch the selector between live feed and standby (GLib main loop only). """
+    global live_active
+    try:
+        if active and is_live and live_pad is not None:
+            selector.set_property("active-pad", live_pad)
+            live_active = True
+        else:
+            selector.set_property("active-pad", selector.get_static_pad("sink_0"))
+            live_active = False
+    except Exception as e:
+        sys.stderr.write(f"[WARN] Failed to switch source: {e}\n")
+    return False
+
+def connection_monitor():
+    """ Attaches/detaches the live source and shows it only while frames are really flowing. """
     while True:
         connected = check_loopback()
-        
         if connected and not is_live:
-            try:
-                # Create live camera source dynamically, immediately matching the 30fps requirement!
-                live_bin = Gst.parse_bin_from_description(
-                    f"v4l2src device={INTERMEDIATE_CAM} ! videoconvert ! videorate ! capsfilter caps=video/x-raw,framerate=30/1",
-                    True
-                )
-                pipeline.add(live_bin)
-                live_pad = selector.request_pad_simple("sink_%u")
-                src_pad = live_bin.get_static_pad("src")
-                src_pad.link(live_pad)
-                
-                # Sync state and switch instantly!
-                live_bin.sync_state_with_parent()
-                selector.set_property("active-pad", live_pad)
-                is_live = True
-            except Exception as e:
-                sys.stderr.write(f"[WARN] Failed to connect live source: {e}\n")
-                # Cleanup partial state
-                if live_bin:
-                    live_bin.set_state(Gst.State.NULL)
-                    try:
-                        pipeline.remove(live_bin)
-                    except:
-                        pass
-                live_bin = None
-                live_pad = None
-                is_live = False
-            
+            GLib.idle_add(do_connect)
         elif not connected and is_live:
-            # Switch back to standby instantly!
-            standby_pad = selector.get_static_pad("sink_0")
-            selector.set_property("active-pad", standby_pad)
-            
-            # Safely remove the live camera source
-            if live_bin:
-                live_bin.set_state(Gst.State.NULL)
-                src_pad = live_bin.get_static_pad("src")
-                if src_pad and live_pad:
-                    src_pad.unlink(live_pad)
-                if live_pad:
-                    selector.release_request_pad(live_pad)
-                pipeline.remove(live_bin)
-            
-            live_bin = None
-            live_pad = None
-            is_live = False
-            
-        time.sleep(1)
+            GLib.idle_add(do_disconnect)
+        elif is_live:
+            flowing = (time.time() - last_buf_time) < 2.0 if last_buf_time else False
+            if flowing and not live_active:
+                GLib.idle_add(set_live_active, True)
+            elif not flowing and live_active:
+                GLib.idle_add(set_live_active, False)
+        time.sleep(0.5)
 
 # Start background threads
 t1 = threading.Thread(target=command_listener, daemon=True)
@@ -156,7 +204,7 @@ t2.start()
 retry_count = 0
 
 def bus_call(bus, message, loop):
-    global retry_count
+    global retry_count, live_bin, live_pad, is_live
     """ Gracefully handles unexpected GStreamer errors """
     t = message.type
     if t == Gst.MessageType.EOS:
@@ -174,6 +222,11 @@ def bus_call(bus, message, loop):
         if "v4l2sink" in src_name or "v4l2sink" in full_err or "busy" in full_err or "output device" in full_err:
             sys.stderr.write(f"\\n[DEBUG] Raw Error: src={src_name}, msg={err.message}, debug={debug}\\n")
             retry_count += 1
+            try:
+                holders = subprocess.run(["fuser", "-v", VIRTUAL_CAM], capture_output=True, text=True)
+                sys.stderr.write(f"[DEBUG] Holders of {VIRTUAL_CAM}: {holders.stdout.strip()} {holders.stderr.strip()}\n")
+            except Exception:
+                pass
             if retry_count > MAX_RETRIES:
                 sys.stderr.write(f"\n[FATAL] Failed to open {VIRTUAL_CAM} after {MAX_RETRIES} retries.\n")
                 sys.stderr.write(f"Something is holding the device. Run: lsof {VIRTUAL_CAM}\n\n")
@@ -181,6 +234,8 @@ def bus_call(bus, message, loop):
                 return True
             
             sys.stderr.write(f"\n[RETRY {retry_count}/{MAX_RETRIES}] {VIRTUAL_CAM} is busy. Retrying in 3 seconds...\n")
+            if is_live:
+                _teardown_live()
             pipeline.set_state(Gst.State.NULL)
             
             def do_restart():

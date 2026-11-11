@@ -23,14 +23,19 @@ nuke_stale_processes() {
     pkill -9 -f "v4l2sink device=$VIRTUAL_CAM" 2>/dev/null
     pkill -9 -f "v4l2sink device=$INTERMEDIATE_CAM" 2>/dev/null
 
-    # Destroy the virtual device if it was left behind
-    v4l2loopback-ctl delete $VIRTUAL_CAM 2>/dev/null
-
-    # Kill any orphaned uxplay (but NOT the systemd one yet — that's handled separately)
+    # Kill any orphaned uxplay
     killall -9 uxplay 2>/dev/null
 
-    # Wait for v4l2loopback to fully release the device handles
-    sleep 2
+    sleep 0.5
+
+    # Force kill any process holding our devices
+    fuser -k -9 "$VIRTUAL_CAM" 2>/dev/null || true
+    fuser -k -9 "$INTERMEDIATE_CAM" 2>/dev/null || true
+    sleep 0.5
+
+    # Recreate virtual device with exclusive_caps=1 so Chrome accepts it as a webcam
+    v4l2loopback-ctl delete "$VIRTUAL_CAM" 2>/dev/null || true
+    sleep 0.5
 }
 
 # ============================================================
@@ -109,18 +114,20 @@ systemctl --user stop uxplay.service 2>/dev/null
 echo "Cleaning up stale processes..."
 nuke_stale_processes
 
-echo "Creating dynamic virtual camera ($VIRTUAL_CAM)..."
-v4l2loopback-ctl add -n "UxPlay Screen" -x 1 $VIRTUAL_CAM || {
-    echo "[ERROR] Failed to create dynamic virtual camera device!"
-    exit 1
-}
-v4l2loopback-ctl set-caps $VIRTUAL_CAM "YUYV:1280x720@30/1"
-
-
+if [ ! -e "$VIRTUAL_CAM" ]; then
+    echo "Creating dynamic virtual camera ($VIRTUAL_CAM)..."
+    v4l2loopback-ctl add -n "UxPlay Virtual Webcam" -x 1 "$VIRTUAL_CAM" || {
+        echo "[ERROR] Failed to create dynamic virtual camera device!"
+        exit 1
+    }
+    sleep 0.5
+else
+    echo "Reusing virtual camera ($VIRTUAL_CAM)..."
+fi
 
 echo "------------------------------------------------------------------------"
 echo "UxPlay Virtual Webcam initialized! (Powered by Python Engine)"
-echo "Target device in web apps (Meet, Zoom, OBS): 'UxPlay Screen' ($VIRTUAL_CAM)"
+echo "Target device in web apps (Meet, Zoom, OBS): 'UxPlay Virtual Webcam' ($VIRTUAL_CAM)"
 echo "------------------------------------------------------------------------"
 echo "Controls (Camera Flip):"
 echo "  'f' = FRONT CAMERA mode (normal)"
@@ -134,15 +141,11 @@ echo ""
 echo "Press 'q' or Ctrl+C to quit and return to normal background mode"
 echo "------------------------------------------------------------------------"
 
-# 1. Start UxPlay AirPlay Receiver in background
-start_uxplay
-sleep 2
-
-# 2. Start the seamless Python engine
+# 1. Start the seamless Python engine (immediately binds to VIRTUAL_CAM as producer)
 start_engine
 
-# Wait a moment then verify the engine is alive
-sleep 2
+# Wait a moment then verify the engine is alive and streaming
+sleep 1.5
 if ! kill -0 "$ENGINE_PID" 2>/dev/null; then
     echo ""
     echo "[ERROR] Python engine failed to start. Check errors above."
@@ -150,6 +153,9 @@ if ! kill -0 "$ENGINE_PID" 2>/dev/null; then
     cleanup
     exit 1
 fi
+
+# 2. Start UxPlay AirPlay Receiver in background
+start_uxplay
 
 echo "Engine running. Ready for AirPlay connections!"
 echo ""
